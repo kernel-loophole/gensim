@@ -27,6 +27,10 @@ except ImportError:
 
 from gensim.models.word2vec_inner cimport bisect_left, random_int32, sscal, REAL_t, EXP_TABLE, our_dot, our_saxpy
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 DEF MAX_DOCUMENT_LEN = 10000
 
 cdef int ONE = 1
@@ -361,7 +365,11 @@ def train_document_dbow(model, doc_words, doctag_indexes, alpha, work=None,
         result += 1
         i += 1
         if i == MAX_DOCUMENT_LEN:
-            break  # TODO: log warning, tally overflow?
+            logger.warning(
+                "document truncated to %i words (from %i words total)",
+                MAX_DOCUMENT_LEN, len(doc_words)
+            )
+            break  # Stop processing this document
     c.document_len = i
 
     if c.train_words:
@@ -498,7 +506,11 @@ def train_document_dm(model, doc_words, doctag_indexes, alpha, work=None, neu1=N
         result += 1
         i += 1
         if i == MAX_DOCUMENT_LEN:
-            break  # TODO: log warning, tally overflow?
+            logger.warning(
+                "document truncated to %i words (from %i words total)",
+                MAX_DOCUMENT_LEN, len(doc_words)
+            )
+            break  # Stop processing this document
     c.document_len = i
 
     # single randint() call avoids a big thread-sync slowdown
@@ -647,7 +659,11 @@ def train_document_dm_concat(model, doc_words, doctag_indexes, alpha, work=None,
         result += 1
         i += 1
         if i == MAX_DOCUMENT_LEN:
-            break  # TODO: log warning, tally overflow?
+            logger.warning(
+                "document truncated to %i words (from %i words total)",
+                MAX_DOCUMENT_LEN, len(doc_words)
+            )
+            break  # Stop processing this document
     c.document_len = i
 
     for i in range(c.doctag_len):

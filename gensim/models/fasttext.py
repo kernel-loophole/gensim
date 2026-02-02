@@ -364,7 +364,7 @@ class FastText(Word2Vec):
         batch_words : int, optional
             Target size (in words) for batches of examples passed to worker threads (and
             thus cython routines).(Larger batches will be passed if individual
-            texts are longer than 10000 words, but the standard cython code truncates to that maximum.)
+            texts are longer than 10000 words, which are automatically chunked for processing.)
         min_n : int, optional
             Minimum length of char n-grams to be used for training word representations.
         max_n : int, optional

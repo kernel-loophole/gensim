@@ -59,6 +59,10 @@ from libc.string cimport memset
 from gensim.models.word2vec_inner cimport bisect_left, random_int32, scopy, sscal, \
      REAL_t, our_dot, our_saxpy
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 DEF MAX_SENTENCE_LEN = 10000
 DEF MAX_SUBWORDS = 1000
 
@@ -497,7 +501,11 @@ cdef object populate_ft_config(FastTextConfig *c, wv, buckets_word, sentences):
 
             effective_words += 1
             if effective_words == MAX_SENTENCE_LEN:
-                break
+                logger.warning(
+                    "sentence #%i truncated to %i words (from %i words total)",
+                    effective_sentences, MAX_SENTENCE_LEN, len(list(sent))
+                )
+                break  # Stop processing this sentence
 
         # keep track of which words go into which sentence, so we don't train
         # across sentence boundaries.
@@ -505,7 +513,11 @@ cdef object populate_ft_config(FastTextConfig *c, wv, buckets_word, sentences):
         c.sentence_idx[effective_sentences] = effective_words
 
         if effective_words == MAX_SENTENCE_LEN:
-            break
+            logger.warning(
+                "batch buffer full at %i words; remaining sentences will be processed in next batch",
+                MAX_SENTENCE_LEN
+            )
+            break  # Process accumulated sentences in this batch, rest in next batch
 
     return effective_words, effective_sentences
 
