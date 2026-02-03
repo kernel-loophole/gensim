@@ -14,6 +14,9 @@
 
 import cython
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
 
 from gensim.utils import any2utf8
 

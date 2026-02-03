@@ -21,6 +21,9 @@ from libc.math cimport log
 from libc.string cimport memset
 
 import scipy.linalg.blas as fblas
+import logging
+
+logger = logging.getLogger(__name__)
 
 REAL = np.float32
 
@@ -550,7 +553,11 @@ def train_batch_sg(model, sentences, alpha, _work, compute_loss):
                 c.points[effective_words] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
             effective_words += 1
             if effective_words == MAX_SENTENCE_LEN:
-                break  # TODO: log warning, tally overflow?
+                logger.warning(
+                    "sentence #%i truncated to %i words (from %i words total)",
+                    effective_sentences, MAX_SENTENCE_LEN, len(list(sent))
+                )
+                break  # Stop processing this sentence
 
         # keep track of which words go into which sentence, so we don't train
         # across sentence boundaries.
@@ -559,7 +566,11 @@ def train_batch_sg(model, sentences, alpha, _work, compute_loss):
         c.sentence_idx[effective_sentences] = effective_words
 
         if effective_words == MAX_SENTENCE_LEN:
-            break  # TODO: log warning, tally overflow?
+            logger.warning(
+                "batch buffer full at %i words; remaining sentences will be processed in next batch",
+                MAX_SENTENCE_LEN
+            )
+            break  # Process accumulated sentences in this batch, rest in next batch
 
     # precompute "reduced window" offsets in a single randint() call
     if model.shrink_windows:
@@ -650,7 +661,11 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
                 c.points[effective_words] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
             effective_words += 1
             if effective_words == MAX_SENTENCE_LEN:
-                break  # TODO: log warning, tally overflow?
+                logger.warning(
+                    "sentence #%i truncated to %i words (from %i words total)",
+                    effective_sentences, MAX_SENTENCE_LEN, len(list(sent))
+                )
+                break  # Stop processing this sentence
 
         # keep track of which words go into which sentence, so we don't train
         # across sentence boundaries.
@@ -659,7 +674,11 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
         c.sentence_idx[effective_sentences] = effective_words
 
         if effective_words == MAX_SENTENCE_LEN:
-            break  # TODO: log warning, tally overflow?
+            logger.warning(
+                "batch buffer full at %i words; remaining sentences will be processed in next batch",
+                MAX_SENTENCE_LEN
+            )
+            break  # Process accumulated sentences in this batch, rest in next batch
 
     # precompute "reduced window" offsets in a single randint() call
     if model.shrink_windows:
@@ -759,7 +778,11 @@ def score_sentence_sg(model, sentence, _work):
         result += 1
         i += 1
         if i == MAX_SENTENCE_LEN:
-            break  # TODO: log warning, tally overflow?
+            logger.warning(
+                "sentence truncated to %i words for scoring (from %i words total)",
+                MAX_SENTENCE_LEN, len(list(sentence))
+            )
+            break  # Stop processing this sentence
     sentence_len = i
 
     # release GIL & train on the sentence

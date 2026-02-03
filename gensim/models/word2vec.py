@@ -343,7 +343,7 @@ class Word2Vec(utils.SaveLoad):
         batch_words : int, optional
             Target size (in words) for batches of examples passed to worker threads (and
             thus cython routines).(Larger batches will be passed if individual
-            texts are longer than 10000 words, but the standard cython code truncates to that maximum.)
+            texts are longer than 10000 words, which are automatically chunked for processing.)
         compute_loss: bool, optional
             If True, computes and stores loss value which can be retrieved using
             :meth:`~gensim.models.word2vec.Word2Vec.get_latest_training_loss`.
