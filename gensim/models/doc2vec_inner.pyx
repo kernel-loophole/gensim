@@ -17,6 +17,7 @@ from numpy import zeros, float32 as REAL
 cimport numpy as np
 
 from libc.string cimport memset, memcpy
+from libc.stdlib cimport malloc, free
 
 # scipy <= 0.15
 try:
@@ -31,7 +32,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-DEF MAX_DOCUMENT_LEN = 10000
+
 
 cdef int ONE = 1
 cdef REAL_t ONEF = <REAL_t>1.0
@@ -339,88 +340,122 @@ def train_document_dbow(model, doc_words, doctag_indexes, alpha, work=None,
     cdef int i, j
     cdef long result = 0
     cdef np.uint32_t *vocab_sample_ints
+    
+    # Dynamic allocation
+    cdef int max_doc_len = len(doc_words)
+    if max_doc_len < 1000: max_doc_len = 1000 # Minimum buffer
+    cdef int max_doctag_len = len(doctag_indexes)
+    if max_doctag_len < 100: max_doctag_len = 100 # Minimum buffer
 
-    init_d2v_config(&c, model, alpha, learn_doctags, learn_words, learn_hidden, train_words=train_words, work=work,
-                    neu1=None, word_vectors=word_vectors, words_lockf=words_lockf,
-                    doctag_vectors=doctag_vectors, doctags_lockf=doctags_lockf)
-    c.doctag_len = <int>min(MAX_DOCUMENT_LEN, len(doctag_indexes))
-    if c.sample:
-        vocab_sample_ints = <np.uint32_t *>np.PyArray_DATA(model.wv.expandos['sample_int'])
-    if c.hs:
-        vocab_codes = model.wv.expandos['code']
-        vocab_points = model.wv.expandos['point']
+    c.indexes = <np.uint32_t *>malloc(max_doc_len * sizeof(np.uint32_t))
+    c.reduced_windows = <np.uint32_t *>malloc(max_doc_len * sizeof(np.uint32_t))
+    c.codelens = <int *>malloc(max_doc_len * sizeof(int))
+    c.points = <np.uint32_t **>malloc(max_doc_len * sizeof(np.uint32_t *))
+    c.codes = <np.uint8_t **>malloc(max_doc_len * sizeof(np.uint8_t *))
+    c.doctag_indexes = <np.uint32_t *>malloc(max_doctag_len * sizeof(np.uint32_t))
+    # window_indexes not used in DBOW? Check usage. 
+    # Only in DM_concat?
+    # Better to safely allocate if struct has it, but DBOW doesn't use it.
+    # We can check prompt for where window_indexes is defined. It is in Doc2VecConfig.
+    # Just allocate to be safe or set to NULL? 
+    # train_document_dbow doesn't use window_indexes.
+    c.window_indexes = NULL 
+    
+    if not (c.indexes and c.reduced_windows and c.codelens and c.points and c.codes and c.doctag_indexes):
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.codelens: free(c.codelens)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        if c.doctag_indexes: free(c.doctag_indexes)
+        raise MemoryError("Failed to allocate memory for Doc2VecConfig")
 
-    i = 0
-    for token in doc_words:
-        word_index = model.wv.key_to_index.get(token, None)
-        if word_index is None:  # shrink document to leave out word
-            continue  # leaving i unchanged
-        if c.sample and vocab_sample_ints[word_index] < random_int32(&c.next_random):
-            continue
-        c.indexes[i] = word_index
+    try:
+        init_d2v_config(&c, model, alpha, learn_doctags, learn_words, learn_hidden, train_words=train_words, work=work,
+                        neu1=None, word_vectors=word_vectors, words_lockf=words_lockf,
+                        doctag_vectors=doctag_vectors, doctags_lockf=doctags_lockf)
+        c.doctag_len = <int>len(doctag_indexes) # Use full length
+        if c.sample:
+            vocab_sample_ints = <np.uint32_t *>np.PyArray_DATA(model.wv.expandos['sample_int'])
         if c.hs:
-            c.codelens[i] = <int>len(vocab_codes[word_index])
-            c.codes[i] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
-            c.points[i] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
-        result += 1
-        i += 1
-        if i == MAX_DOCUMENT_LEN:
-            logger.warning(
-                "document truncated to %i words (from %i words total)",
-                MAX_DOCUMENT_LEN, len(doc_words)
-            )
-            break  # Stop processing this document
-    c.document_len = i
-
-    if c.train_words:
-        # single randint() call avoids a big thread-synchronization slowdown
-        if model.shrink_windows:
-            for i, item in enumerate(model.random.randint(0, c.window, c.document_len)):
-                c.reduced_windows[i] = item
-        else:
+            vocab_codes = model.wv.expandos['code']
+            vocab_points = model.wv.expandos['point']
+    
+        i = 0
+        for token in doc_words:
+            word_index = model.wv.key_to_index.get(token, None)
+            if word_index is None:  # shrink document to leave out word
+                continue  # leaving i unchanged
+            if c.sample and vocab_sample_ints[word_index] < random_int32(&c.next_random):
+                continue
+            c.indexes[i] = word_index
+            if c.hs:
+                c.codelens[i] = <int>len(vocab_codes[word_index])
+                c.codes[i] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
+                c.points[i] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
+            result += 1
+            i += 1
+            if i >= max_doc_len:
+                break
+        c.document_len = i
+    
+        if c.train_words:
+            # single randint() call avoids a big thread-synchronization slowdown
+            if model.shrink_windows:
+                for i, item in enumerate(model.random.randint(0, c.window, c.document_len)):
+                    c.reduced_windows[i] = item
+            else:
+                for i in range(c.document_len):
+                    c.reduced_windows[i] = 0
+    
+        for i in range(c.doctag_len):
+            if i >= max_doctag_len: break
+            c.doctag_indexes[i] = doctag_indexes[i]
+            result += 1
+    
+        # release GIL & train on the document
+        with nogil:
             for i in range(c.document_len):
-                c.reduced_windows[i] = 0
-
-    for i in range(c.doctag_len):
-        c.doctag_indexes[i] = doctag_indexes[i]
-        result += 1
-
-    # release GIL & train on the document
-    with nogil:
-        for i in range(c.document_len):
-            if c.train_words:  # simultaneous skip-gram wordvec-training
-                j = i - c.window + c.reduced_windows[i]
-                if j < 0:
-                    j = 0
-                k = i + c.window + 1 - c.reduced_windows[i]
-                if k > c.document_len:
-                    k = c.document_len
-                for j in range(j, k):
-                    if j == i:
-                        continue
+                if c.train_words:  # simultaneous skip-gram wordvec-training
+                    j = i - c.window + c.reduced_windows[i]
+                    if j < 0:
+                        j = 0
+                    k = i + c.window + 1 - c.reduced_windows[i]
+                    if k > c.document_len:
+                        k = c.document_len
+                    for j in range(j, k):
+                        if j == i:
+                            continue
+                        if c.hs:
+                            # we reuse the DBOW function, as it is equivalent to skip-gram for this purpose
+                            fast_document_dbow_hs(c.points[i], c.codes[i], c.codelens[i], c.word_vectors, c.syn1, c.layer1_size,
+                                                  c.indexes[j], c.alpha, c.work, c.learn_words, c.learn_hidden, c.words_lockf,
+                                                  c.words_lockf_len)
+                        if c.negative:
+                            # we reuse the DBOW function, as it is equivalent to skip-gram for this purpose
+                            c.next_random = fast_document_dbow_neg(c.negative, c.cum_table, c.cum_table_len, c.word_vectors,
+                                                                   c.syn1neg, c.layer1_size, c.indexes[i], c.indexes[j],
+                                                                   c.alpha, c.work, c.next_random, c.learn_words,
+                                                                   c.learn_hidden, c.words_lockf, c.words_lockf_len)
+    
+                # docvec-training
+                for j in range(c.doctag_len):
                     if c.hs:
-                        # we reuse the DBOW function, as it is equivalent to skip-gram for this purpose
-                        fast_document_dbow_hs(c.points[i], c.codes[i], c.codelens[i], c.word_vectors, c.syn1, c.layer1_size,
-                                              c.indexes[j], c.alpha, c.work, c.learn_words, c.learn_hidden, c.words_lockf,
-                                              c.words_lockf_len)
+                        fast_document_dbow_hs(c.points[i], c.codes[i], c.codelens[i], c.doctag_vectors, c.syn1, c.layer1_size,
+                                              c.doctag_indexes[j], c.alpha, c.work, c.learn_doctags, c.learn_hidden, c.doctags_lockf,
+                                              c.doctags_lockf_len)
                     if c.negative:
-                        # we reuse the DBOW function, as it is equivalent to skip-gram for this purpose
-                        c.next_random = fast_document_dbow_neg(c.negative, c.cum_table, c.cum_table_len, c.word_vectors,
-                                                               c.syn1neg, c.layer1_size, c.indexes[i], c.indexes[j],
-                                                               c.alpha, c.work, c.next_random, c.learn_words,
-                                                               c.learn_hidden, c.words_lockf, c.words_lockf_len)
-
-            # docvec-training
-            for j in range(c.doctag_len):
-                if c.hs:
-                    fast_document_dbow_hs(c.points[i], c.codes[i], c.codelens[i], c.doctag_vectors, c.syn1, c.layer1_size,
-                                          c.doctag_indexes[j], c.alpha, c.work, c.learn_doctags, c.learn_hidden, c.doctags_lockf,
-                                          c.doctags_lockf_len)
-                if c.negative:
-                    c.next_random = fast_document_dbow_neg(c.negative, c.cum_table, c.cum_table_len, c.doctag_vectors,
-                                                           c.syn1neg, c.layer1_size, c.indexes[i], c.doctag_indexes[j],
-                                                           c.alpha, c.work, c.next_random, c.learn_doctags,
-                                                           c.learn_hidden, c.doctags_lockf, c.doctags_lockf_len)
+                        c.next_random = fast_document_dbow_neg(c.negative, c.cum_table, c.cum_table_len, c.doctag_vectors,
+                                                               c.syn1neg, c.layer1_size, c.indexes[i], c.doctag_indexes[j],
+                                                               c.alpha, c.work, c.next_random, c.learn_doctags,
+                                                               c.learn_hidden, c.doctags_lockf, c.doctags_lockf_len)
+    finally:
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.codelens: free(c.codelens)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        if c.doctag_indexes: free(c.doctag_indexes)
 
     return result
 
@@ -479,101 +514,132 @@ def train_document_dm(model, doc_words, doctag_indexes, alpha, work=None, neu1=N
     cdef int i, j, k, m
     cdef long result = 0
     cdef np.uint32_t *vocab_sample_ints
+    
+    # Dynamic allocation
+    cdef int max_doc_len = len(doc_words)
+    if max_doc_len < 1000: max_doc_len = 1000 # Minimum buffer
+    cdef int max_doctag_len = len(doctag_indexes)
+    if max_doctag_len < 100: max_doctag_len = 100 # Minimum buffer
 
-    init_d2v_config(&c, model, alpha, learn_doctags, learn_words, learn_hidden, train_words=False,
-                    work=work, neu1=neu1, word_vectors=word_vectors, words_lockf=words_lockf,
-                    doctag_vectors=doctag_vectors, doctags_lockf=doctags_lockf)
-    c.doctag_len = <int>min(MAX_DOCUMENT_LEN, len(doctag_indexes))
-    if c.sample:
-        vocab_sample_ints = <np.uint32_t *>np.PyArray_DATA(model.wv.expandos['sample_int'])
-#        vocab_sample_ints = model.wv.expandos['sample_int']  # this variant noticeably slower
-    if c.hs:
-        vocab_codes = model.wv.expandos['code']
-        vocab_points = model.wv.expandos['point']
+    c.indexes = <np.uint32_t *>malloc(max_doc_len * sizeof(np.uint32_t))
+    c.reduced_windows = <np.uint32_t *>malloc(max_doc_len * sizeof(np.uint32_t))
+    c.codelens = <int *>malloc(max_doc_len * sizeof(int))
+    c.points = <np.uint32_t **>malloc(max_doc_len * sizeof(np.uint32_t *))
+    c.codes = <np.uint8_t **>malloc(max_doc_len * sizeof(np.uint8_t *))
+    c.doctag_indexes = <np.uint32_t *>malloc(max_doctag_len * sizeof(np.uint32_t))
+    # window_indexes unused in DM? No, check usages.
+    # Logic below (lines 530-577) doesn't use `window_indexes`.
+    # Only `indexes` and `reduced_windows`.
+    c.window_indexes = NULL
 
-    i = 0
-    for token in doc_words:
-        word_index = model.wv.key_to_index.get(token, None)
-        if word_index is None:  # shrink document to leave out word
-            continue  # leaving i unchanged
-        if c.sample and vocab_sample_ints[word_index] < random_int32(&c.next_random):
-            continue
-        c.indexes[i] = word_index
+    if not (c.indexes and c.reduced_windows and c.codelens and c.points and c.codes and c.doctag_indexes):
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.codelens: free(c.codelens)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        if c.doctag_indexes: free(c.doctag_indexes)
+        raise MemoryError("Failed to allocate memory for Doc2VecConfig")
+
+    try:
+        init_d2v_config(&c, model, alpha, learn_doctags, learn_words, learn_hidden, train_words=False,
+                        work=work, neu1=neu1, word_vectors=word_vectors, words_lockf=words_lockf,
+                        doctag_vectors=doctag_vectors, doctags_lockf=doctags_lockf)
+        c.doctag_len = <int>len(doctag_indexes)
+        if c.sample:
+            vocab_sample_ints = <np.uint32_t *>np.PyArray_DATA(model.wv.expandos['sample_int'])
+    #        vocab_sample_ints = model.wv.expandos['sample_int']  # this variant noticeably slower
         if c.hs:
-            c.codelens[i] = <int>len(vocab_codes[word_index])
-            c.codes[i] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
-            c.points[i] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
-        result += 1
-        i += 1
-        if i == MAX_DOCUMENT_LEN:
-            logger.warning(
-                "document truncated to %i words (from %i words total)",
-                MAX_DOCUMENT_LEN, len(doc_words)
-            )
-            break  # Stop processing this document
-    c.document_len = i
-
-    # single randint() call avoids a big thread-sync slowdown
-    if model.shrink_windows:
-        for i, item in enumerate(model.random.randint(0, c.window, c.document_len)):
-            c.reduced_windows[i] = item
-    else:
-        for i in range(c.document_len):
-            c.reduced_windows[i] = 0
-
-    for i in range(c.doctag_len):
-        c.doctag_indexes[i] = doctag_indexes[i]
-        result += 1
-
-    # release GIL & train on the document
-    with nogil:
-        for i in range(c.document_len):
-            j = i - c.window + c.reduced_windows[i]
-            if j < 0:
-                j = 0
-            k = i + c.window + 1 - c.reduced_windows[i]
-            if k > c.document_len:
-                k = c.document_len
-
-            # compose l1 (in _neu1) & clear _work
-            memset(c.neu1, 0, c.layer1_size * cython.sizeof(REAL_t))
-            count = <REAL_t>0.0
-            for m in range(j, k):
-                if m == i:
-                    continue
-                else:
-                    count += ONEF
-                    our_saxpy(&c.layer1_size, &ONEF, &c.word_vectors[c.indexes[m] * c.layer1_size], &ONE, c.neu1, &ONE)
-            for m in range(c.doctag_len):
-                count += ONEF
-                our_saxpy(&c.layer1_size, &ONEF, &c.doctag_vectors[c.doctag_indexes[m] * c.layer1_size], &ONE, c.neu1, &ONE)
-            if count > (<REAL_t>0.5):
-                inv_count = ONEF/count
-            if c.cbow_mean:
-                sscal(&c.layer1_size, &inv_count, c.neu1, &ONE)  # (does this need BLAS-variants like saxpy?)
-            memset(c.work, 0, c.layer1_size * cython.sizeof(REAL_t))  # work to accumulate l1 error
+            vocab_codes = model.wv.expandos['code']
+            vocab_points = model.wv.expandos['point']
+    
+        i = 0
+        for token in doc_words:
+            word_index = model.wv.key_to_index.get(token, None)
+            if word_index is None:  # shrink document to leave out word
+                continue  # leaving i unchanged
+            if c.sample and vocab_sample_ints[word_index] < random_int32(&c.next_random):
+                continue
+            c.indexes[i] = word_index
             if c.hs:
-                fast_document_dm_hs(c.points[i], c.codes[i], c.codelens[i], c.neu1, c.syn1, c.alpha, c.work,
-                                    c.layer1_size, c.learn_hidden)
-            if c.negative:
-                c.next_random = fast_document_dm_neg(c.negative, c.cum_table, c.cum_table_len, c.next_random,
-                                                     c.neu1, c.syn1neg, c.indexes[i], c.alpha, c.work, c.layer1_size,
-                                                     c.learn_hidden)
-
-            if not c.cbow_mean:
-                sscal(&c.layer1_size, &inv_count, c.work, &ONE)  # (does this need BLAS-variants like saxpy?)
-            # apply accumulated error in work
-            if c.learn_doctags:
-                for m in range(c.doctag_len):
-                    our_saxpy(&c.layer1_size, &c.doctags_lockf[c.doctag_indexes[m] % c.doctags_lockf_len], c.work,
-                              &ONE, &c.doctag_vectors[c.doctag_indexes[m] * c.layer1_size], &ONE)
-            if c.learn_words:
+                c.codelens[i] = <int>len(vocab_codes[word_index])
+                c.codes[i] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
+                c.points[i] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
+            result += 1
+            i += 1
+            if i >= max_doc_len:
+                break
+        c.document_len = i
+    
+        # single randint() call avoids a big thread-sync slowdown
+        if model.shrink_windows:
+            for i, item in enumerate(model.random.randint(0, c.window, c.document_len)):
+                c.reduced_windows[i] = item
+        else:
+            for i in range(c.document_len):
+                c.reduced_windows[i] = 0
+    
+        for i in range(c.doctag_len):
+            if i >= max_doctag_len: break
+            c.doctag_indexes[i] = doctag_indexes[i]
+            result += 1
+    
+        # release GIL & train on the document
+        with nogil:
+            for i in range(c.document_len):
+                j = i - c.window + c.reduced_windows[i]
+                if j < 0:
+                    j = 0
+                k = i + c.window + 1 - c.reduced_windows[i]
+                if k > c.document_len:
+                    k = c.document_len
+    
+                # compose l1 (in _neu1) & clear _work
+                memset(c.neu1, 0, c.layer1_size * cython.sizeof(REAL_t))
+                count = <REAL_t>0.0
                 for m in range(j, k):
                     if m == i:
                         continue
                     else:
-                         our_saxpy(&c.layer1_size, &c.words_lockf[c.indexes[m] % c.doctags_lockf_len], c.work, &ONE,
-                                   &c.word_vectors[c.indexes[m] * c.layer1_size], &ONE)
+                        count += ONEF
+                        our_saxpy(&c.layer1_size, &ONEF, &c.word_vectors[c.indexes[m] * c.layer1_size], &ONE, c.neu1, &ONE)
+                for m in range(c.doctag_len):
+                    count += ONEF
+                    our_saxpy(&c.layer1_size, &ONEF, &c.doctag_vectors[c.doctag_indexes[m] * c.layer1_size], &ONE, c.neu1, &ONE)
+                if count > (<REAL_t>0.5):
+                    inv_count = ONEF/count
+                if c.cbow_mean:
+                    sscal(&c.layer1_size, &inv_count, c.neu1, &ONE)  # (does this need BLAS-variants like saxpy?)
+                memset(c.work, 0, c.layer1_size * cython.sizeof(REAL_t))  # work to accumulate l1 error
+                if c.hs:
+                    fast_document_dm_hs(c.points[i], c.codes[i], c.codelens[i], c.neu1, c.syn1, c.alpha, c.work,
+                                        c.layer1_size, c.learn_hidden)
+                if c.negative:
+                    c.next_random = fast_document_dm_neg(c.negative, c.cum_table, c.cum_table_len, c.next_random,
+                                                         c.neu1, c.syn1neg, c.indexes[i], c.alpha, c.work, c.layer1_size,
+                                                         c.learn_hidden)
+    
+                if not c.cbow_mean:
+                    sscal(&c.layer1_size, &inv_count, c.work, &ONE)  # (does this need BLAS-variants like saxpy?)
+                # apply accumulated error in work
+                if c.learn_doctags:
+                    for m in range(c.doctag_len):
+                        our_saxpy(&c.layer1_size, &c.doctags_lockf[c.doctag_indexes[m] % c.doctags_lockf_len], c.work,
+                                  &ONE, &c.doctag_vectors[c.doctag_indexes[m] * c.layer1_size], &ONE)
+                if c.learn_words:
+                    for m in range(j, k):
+                        if m == i:
+                            continue
+                        else:
+                             our_saxpy(&c.layer1_size, &c.words_lockf[c.indexes[m] % c.doctags_lockf_len], c.work, &ONE,
+                                       &c.word_vectors[c.indexes[m] * c.layer1_size], &ONE)
+    finally:
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.codelens: free(c.codelens)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        if c.doctag_indexes: free(c.doctag_indexes)
 
     return result
 
@@ -631,87 +697,144 @@ def train_document_dm_concat(model, doc_words, doctag_indexes, alpha, work=None,
     cdef int i, j, k, m, n
     cdef long result = 0
     cdef np.uint32_t *vocab_sample_ints
+    
+    # Dynamic allocation
+    cdef int max_doc_len = len(doc_words)
+    if max_doc_len < 1000: max_doc_len = 1000 # Minimum buffer
+    cdef int max_doctag_len = len(doctag_indexes)
+    if max_doctag_len < 100: max_doctag_len = 100 # Minimum buffer
 
-    init_d2v_config(&c, model, alpha, learn_doctags, learn_words, learn_hidden, train_words=False, work=work, neu1=neu1,
-                    word_vectors=word_vectors, words_lockf=words_lockf, doctag_vectors=doctag_vectors, doctags_lockf=doctags_lockf)
-    c.doctag_len = <int>min(MAX_DOCUMENT_LEN, len(doctag_indexes))
-    if c.sample:
-        vocab_sample_ints = <np.uint32_t *>np.PyArray_DATA(model.wv.expandos['sample_int'])
-    if c.hs:
-        vocab_codes = model.wv.expandos['code']
-        vocab_points = model.wv.expandos['point']
+    c.indexes = <np.uint32_t *>malloc(max_doc_len * sizeof(np.uint32_t))
+    c.reduced_windows = <np.uint32_t *>malloc(max_doc_len * sizeof(np.uint32_t))
+    c.codelens = <int *>malloc(max_doc_len * sizeof(int))
+    c.points = <np.uint32_t **>malloc(max_doc_len * sizeof(np.uint32_t *))
+    c.codes = <np.uint8_t **>malloc(max_doc_len * sizeof(np.uint8_t *))
+    c.doctag_indexes = <np.uint32_t *>malloc(max_doctag_len * sizeof(np.uint32_t))
+    c.window_indexes = <np.uint32_t *>malloc((2 * c.window + 1) * sizeof(np.uint32_t)) # Used in DM_concat
+    # Actually window_indexes size?
+    # In loop: `for m in range(2 * c.window):`
+    # So `2 * c.window` is enough. Added +1 for safety.
+    # Note: `c.window` is not set until `init_d2v_config` is called?
+    # NO. `init_d2v_config` sets `c.window` from `model.window`.
+    # But `init_d2v_config` is called below! 
+    # WE MUST CALL init_d2v_config BEFORE using c.window.
+    # But we want to allocate before init? Or after?
+    # initializing struct members is fine after `init`.
+    # But `c.window` is uninitialized here!
+    
+    # Let's call init first.
+    # BUT `c` holds pointers. `init` might overwrite them?
+    # `init_d2v_config` in `doc2vec_inner.pyx` mainly sets scalars and pointers from model.
+    # It does NOT zero out our allocated pointers (unless we explicitly pass them? No, it sets members).
+    # `init_d2v_config` does NOT touch `indexes`, `reduced_windows` etc.
+    # So it is safe to call before or after.
+    # BUT we need `c.window` for `window_indexes` size.
+    # So we MUST call `init` first or access `model.window`.
+    
+    # Let's use `model.window`.
+    cdef int win_size = model.window
+    c.window_indexes = <np.uint32_t *>malloc((2 * win_size + 1) * sizeof(np.uint32_t))
 
-    if c.doctag_len != c.expected_doctag_len:
-        return 0  # skip doc without expected number of tags
+    if not (c.indexes and c.reduced_windows and c.codelens and c.points and c.codes and c.doctag_indexes and c.window_indexes):
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.codelens: free(c.codelens)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        if c.doctag_indexes: free(c.doctag_indexes)
+        if c.window_indexes: free(c.window_indexes)
+        raise MemoryError("Failed to allocate memory for Doc2VecConfig")
 
-    i = 0
-    for token in doc_words:
-        word_index = model.wv.key_to_index.get(token, None)
-        if word_index is None:  # shrink document to leave out word
-            continue  # leaving i unchanged
-        if c.sample and vocab_sample_ints[word_index] < random_int32(&c.next_random):
-            continue
-        c.indexes[i] = word_index
+    try:
+        init_d2v_config(&c, model, alpha, learn_doctags, learn_words, learn_hidden, train_words=False, work=work, neu1=neu1,
+                        word_vectors=word_vectors, words_lockf=words_lockf, doctag_vectors=doctag_vectors, doctags_lockf=doctags_lockf)
+        c.doctag_len = <int>len(doctag_indexes)
+        if c.sample:
+            vocab_sample_ints = <np.uint32_t *>np.PyArray_DATA(model.wv.expandos['sample_int'])
         if c.hs:
-            c.codelens[i] = <int>len(vocab_codes[word_index])
-            c.codes[i] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
-            c.points[i] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
-        result += 1
-        i += 1
-        if i == MAX_DOCUMENT_LEN:
-            logger.warning(
-                "document truncated to %i words (from %i words total)",
-                MAX_DOCUMENT_LEN, len(doc_words)
-            )
-            break  # Stop processing this document
-    c.document_len = i
-
-    for i in range(c.doctag_len):
-        c.doctag_indexes[i] = doctag_indexes[i]
-        result += 1
-
-    # release GIL & train on the document
-    with nogil:
-        for i in range(c.document_len):
-            j = i - c.window      # negative OK: will pad with null word
-            k = i + c.window + 1  # past document end OK: will pad with null word
-
-            # compose l1 & clear work
-            for m in range(c.doctag_len):
-                # doc vector(s)
-                memcpy(&c.neu1[m * c.vector_size], &c.doctag_vectors[c.doctag_indexes[m] * c.vector_size],
-                       c.vector_size * cython.sizeof(REAL_t))
-            n = 0
-            for m in range(j, k):
-                # word vectors in window
-                if m == i:
-                    continue
-                if m < 0 or m >= c.document_len:
-                    c.window_indexes[n] = c.null_word_index
-                else:
-                    c.window_indexes[n] = c.indexes[m]
-                n += 1
-            for m in range(2 * c.window):
-                memcpy(&c.neu1[(c.doctag_len + m) * c.vector_size], &c.word_vectors[c.window_indexes[m] * c.vector_size],
-                       c.vector_size * cython.sizeof(REAL_t))
-            memset(c.work, 0, c.layer1_size * cython.sizeof(REAL_t))  # work to accumulate l1 error
-
+            vocab_codes = model.wv.expandos['code']
+            vocab_points = model.wv.expandos['point']
+    
+        if c.doctag_len != c.expected_doctag_len:
+            # return 0  # skip doc without expected number of tags
+            # We must free memory before returning!
+            # Since we are in `try`, we can just `return 0` and `finally` will execute?
+            # Cython/Python exception handling interaction: `finally` blocks (via `try`) are executed on return.
+            return 0
+    
+        i = 0
+        for token in doc_words:
+            word_index = model.wv.key_to_index.get(token, None)
+            if word_index is None:  # shrink document to leave out word
+                continue  # leaving i unchanged
+            if c.sample and vocab_sample_ints[word_index] < random_int32(&c.next_random):
+                continue
+            c.indexes[i] = word_index
             if c.hs:
-                fast_document_dmc_hs(c.points[i], c.codes[i], c.codelens[i],
-                                     c.neu1, c.syn1, c.alpha, c.work,
-                                     c.layer1_size, c.vector_size, c.learn_hidden)
-            if c.negative:
-                c.next_random = fast_document_dmc_neg(c.negative, c.cum_table, c.cum_table_len, c.next_random,
-                                                      c.neu1, c.syn1neg, c.indexes[i], c.alpha, c.work,
-                                                      c.layer1_size, c.vector_size, c.learn_hidden)
-
-            if c.learn_doctags:
+                c.codelens[i] = <int>len(vocab_codes[word_index])
+                c.codes[i] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
+                c.points[i] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
+            result += 1
+            i += 1
+            if i >= max_doc_len:
+                break
+        c.document_len = i
+    
+        for i in range(c.doctag_len):
+            if i >= max_doctag_len: break
+            c.doctag_indexes[i] = doctag_indexes[i]
+            result += 1
+    
+        # release GIL & train on the document
+        with nogil:
+            for i in range(c.document_len):
+                j = i - c.window      # negative OK: will pad with null word
+                k = i + c.window + 1  # past document end OK: will pad with null word
+    
+                # compose l1 & clear work
                 for m in range(c.doctag_len):
-                    our_saxpy(&c.vector_size, &c.doctags_lockf[c.doctag_indexes[m] % c.doctags_lockf_len], &c.work[m * c.vector_size],
-                              &ONE, &c.doctag_vectors[c.doctag_indexes[m] * c.vector_size], &ONE)
-            if c.learn_words:
+                    # doc vector(s)
+                    memcpy(&c.neu1[m * c.vector_size], &c.doctag_vectors[c.doctag_indexes[m] * c.vector_size],
+                           c.vector_size * cython.sizeof(REAL_t))
+                n = 0
+                for m in range(j, k):
+                    # word vectors in window
+                    if m == i:
+                        continue
+                    if m < 0 or m >= c.document_len:
+                        c.window_indexes[n] = c.null_word_index
+                    else:
+                        c.window_indexes[n] = c.indexes[m]
+                    n += 1
                 for m in range(2 * c.window):
-                    our_saxpy(&c.vector_size, &c.words_lockf[c.window_indexes[m] % c.words_lockf_len], &c.work[(c.doctag_len + m) * c.vector_size],
-                              &ONE, &c.word_vectors[c.window_indexes[m] * c.vector_size], &ONE)
+                    memcpy(&c.neu1[(c.doctag_len + m) * c.vector_size], &c.word_vectors[c.window_indexes[m] * c.vector_size],
+                           c.vector_size * cython.sizeof(REAL_t))
+                memset(c.work, 0, c.layer1_size * cython.sizeof(REAL_t))  # work to accumulate l1 error
+    
+                if c.hs:
+                    fast_document_dmc_hs(c.points[i], c.codes[i], c.codelens[i],
+                                         c.neu1, c.syn1, c.alpha, c.work,
+                                         c.layer1_size, c.vector_size, c.learn_hidden)
+                if c.negative:
+                    c.next_random = fast_document_dmc_neg(c.negative, c.cum_table, c.cum_table_len, c.next_random,
+                                                          c.neu1, c.syn1neg, c.indexes[i], c.alpha, c.work,
+                                                          c.layer1_size, c.vector_size, c.learn_hidden)
+    
+                if c.learn_doctags:
+                    for m in range(c.doctag_len):
+                        our_saxpy(&c.vector_size, &c.doctags_lockf[c.doctag_indexes[m] % c.doctags_lockf_len], &c.work[m * c.vector_size],
+                                  &ONE, &c.doctag_vectors[c.doctag_indexes[m] * c.vector_size], &ONE)
+                if c.learn_words:
+                    for m in range(2 * c.window):
+                        our_saxpy(&c.vector_size, &c.words_lockf[c.window_indexes[m] % c.words_lockf_len], &c.work[(c.doctag_len + m) * c.vector_size],
+                                  &ONE, &c.word_vectors[c.window_indexes[m] * c.vector_size], &ONE)
+    finally:
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.codelens: free(c.codelens)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        if c.doctag_indexes: free(c.doctag_indexes)
+        if c.window_indexes: free(c.window_indexes)
 
     return result

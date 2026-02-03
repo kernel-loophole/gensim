@@ -39,7 +39,7 @@ DEF EXP_TABLE_SIZE = 1000
 DEF MAX_EXP = 6
 cdef REAL_t[EXP_TABLE_SIZE] EXP_TABLE
 
-DEF MAX_SENTENCE_LEN = 10000
+
 
 # function implementations swapped based on BLAS detected in word2vec_inner.pyx init()
 ctypedef REAL_t (*our_dot_ptr) (const int *N, const float *X, const int *incX, const float *Y, const int *incY) noexcept nogil
@@ -58,16 +58,16 @@ cdef struct Word2VecConfig:
     np.uint32_t words_lockf_len
     REAL_t *work
     REAL_t *neu1
-
-    int codelens[MAX_SENTENCE_LEN]
-    np.uint32_t indexes[MAX_SENTENCE_LEN]
-    np.uint32_t reduced_windows[MAX_SENTENCE_LEN]
-    int sentence_idx[MAX_SENTENCE_LEN + 1]
+    
+    int *codelens
+    np.uint32_t *indexes
+    np.uint32_t *reduced_windows
+    int *sentence_idx
 
     # For hierarchical softmax
     REAL_t *syn1
-    np.uint32_t *points[MAX_SENTENCE_LEN]
-    np.uint8_t *codes[MAX_SENTENCE_LEN]
+    np.uint32_t **points
+    np.uint8_t **codes
 
     # For negative sampling
     REAL_t *syn1neg
@@ -109,17 +109,17 @@ cdef unsigned long long w2v_fast_sentence_sg_neg(
 
 
 cdef void w2v_fast_sentence_cbow_hs(
-    const np.uint32_t *word_point, const np.uint8_t *word_code, int codelens[MAX_SENTENCE_LEN],
+    const np.uint32_t *word_point, const np.uint8_t *word_code, int *codelens,
     REAL_t *neu1, REAL_t *syn0, REAL_t *syn1, const int size,
-    const np.uint32_t indexes[MAX_SENTENCE_LEN], const REAL_t alpha, REAL_t *work,
+    const np.uint32_t *indexes, const REAL_t alpha, REAL_t *work,
     int i, int j, int k, int cbow_mean, REAL_t *words_lockf,
     const np.uint32_t lockf_len, const int _compute_loss, REAL_t *_running_training_loss_param) noexcept nogil
 
 
 cdef unsigned long long w2v_fast_sentence_cbow_neg(
-    const int negative, np.uint32_t *cum_table, unsigned long long cum_table_len, int codelens[MAX_SENTENCE_LEN],
+    const int negative, np.uint32_t *cum_table, unsigned long long cum_table_len, int *codelens,
     REAL_t *neu1,  REAL_t *syn0, REAL_t *syn1neg, const int size,
-    const np.uint32_t indexes[MAX_SENTENCE_LEN], const REAL_t alpha, REAL_t *work,
+    const np.uint32_t *indexes, const REAL_t alpha, REAL_t *work,
     int i, int j, int k, int cbow_mean, unsigned long long next_random, REAL_t *words_lockf,
     const np.uint32_t lockf_len, const int _compute_loss, REAL_t *_running_training_loss_param) noexcept nogil
 

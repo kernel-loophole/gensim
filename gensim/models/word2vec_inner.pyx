@@ -19,6 +19,8 @@ cimport numpy as np
 from libc.math cimport exp
 from libc.math cimport log
 from libc.string cimport memset
+from libc.stdlib cimport malloc, free
+from libc.stdlib cimport malloc, free
 
 import scipy.linalg.blas as fblas
 import logging
@@ -247,9 +249,9 @@ cdef unsigned long long w2v_fast_sentence_sg_neg(
 
 
 cdef void w2v_fast_sentence_cbow_hs(
-    const np.uint32_t *word_point, const np.uint8_t *word_code, int codelens[MAX_SENTENCE_LEN],
+    const np.uint32_t *word_point, const np.uint8_t *word_code, int *codelens,
     REAL_t *neu1, REAL_t *syn0, REAL_t *syn1, const int size,
-    const np.uint32_t indexes[MAX_SENTENCE_LEN], const REAL_t alpha, REAL_t *work,
+    const np.uint32_t *indexes, const REAL_t alpha, REAL_t *work,
     int i, int j, int k, int cbow_mean, REAL_t *words_lockf, const np.uint32_t lockf_len,
     const int _compute_loss, REAL_t *_running_training_loss_param) noexcept nogil:
     """Train on a single effective word from the current batch, using the CBOW method.
@@ -345,9 +347,9 @@ cdef void w2v_fast_sentence_cbow_hs(
 
 
 cdef unsigned long long w2v_fast_sentence_cbow_neg(
-    const int negative, np.uint32_t *cum_table, unsigned long long cum_table_len, int codelens[MAX_SENTENCE_LEN],
+    const int negative, np.uint32_t *cum_table, unsigned long long cum_table_len, int *codelens,
     REAL_t *neu1,  REAL_t *syn0, REAL_t *syn1neg, const int size,
-    const np.uint32_t indexes[MAX_SENTENCE_LEN], const REAL_t alpha, REAL_t *work,
+    const np.uint32_t *indexes, const REAL_t alpha, REAL_t *work,
     int i, int j, int k, int cbow_mean, unsigned long long next_random, REAL_t *words_lockf,
     const np.uint32_t lockf_len, const int _compute_loss, REAL_t *_running_training_loss_param) noexcept nogil:
     """Train on a single effective word from the current batch, using the CBOW method.
@@ -528,77 +530,105 @@ def train_batch_sg(model, sentences, alpha, _work, compute_loss):
     cdef int sent_idx, idx_start, idx_end
     cdef np.uint32_t *vocab_sample_ints
 
-    init_w2v_config(&c, model, alpha, compute_loss, _work)
-    if c.sample:
-        vocab_sample_ints = <np.uint32_t *>np.PyArray_DATA(model.wv.expandos['sample_int'])
-    if c.hs:
-        vocab_codes = model.wv.expandos['code']
-        vocab_points = model.wv.expandos['point']
-
-    # prepare C structures so we can go "full C" and release the Python GIL
-    c.sentence_idx[0] = 0  # indices of the first sentence always start at 0
+    cdef size_t total_words = 0
+    cdef size_t total_sents = 0
+    # Scan sentences for total length
     for sent in sentences:
-        if not sent:
-            continue  # ignore empty sentences; leave effective_sentences unchanged
-        for token in sent:
-            if token not in model.wv.key_to_index:
-                continue  # leaving `effective_words` unchanged = shortening the sentence = expanding the window
-            word_index = model.wv.key_to_index[token]
-            if c.sample and vocab_sample_ints[word_index] < random_int32(&c.next_random):
-                continue
-            c.indexes[effective_words] = word_index
-            if c.hs:
-                c.codelens[effective_words] = <int>len(vocab_codes[word_index])
-                c.codes[effective_words] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
-                c.points[effective_words] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
-            effective_words += 1
-            if effective_words == MAX_SENTENCE_LEN:
-                logger.warning(
-                    "sentence #%i truncated to %i words (from %i words total)",
-                    effective_sentences, MAX_SENTENCE_LEN, len(list(sent))
-                )
-                break  # Stop processing this sentence
+        total_words += len(sent)
+        total_sents += 1
+    
+    # Minimum buffer to avoid issues with empty batches or very small ones
+    if total_words < 1000: total_words = 1000
+    
+    # Allocate dynamic arrays
+    c.indexes = <np.uint32_t *>malloc(total_words * sizeof(np.uint32_t))
+    c.reduced_windows = <np.uint32_t *>malloc(total_words * sizeof(np.uint32_t))
+    c.sentence_idx = <int *>malloc((total_sents + 1) * sizeof(int))
+    c.codelens = <int *>malloc(total_words * sizeof(int))
+    c.points = <np.uint32_t **>malloc(total_words * sizeof(np.uint32_t *))
+    c.codes = <np.uint8_t **>malloc(total_words * sizeof(np.uint8_t *))
 
-        # keep track of which words go into which sentence, so we don't train
-        # across sentence boundaries.
-        # indices of sentence number X are between <sentence_idx[X], sentence_idx[X])
-        effective_sentences += 1
-        c.sentence_idx[effective_sentences] = effective_words
+    if not (c.indexes and c.reduced_windows and c.sentence_idx and c.codelens and c.points and c.codes):
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.sentence_idx: free(c.sentence_idx)
+        if c.codelens: free(c.codelens)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        raise MemoryError("Failed to allocate memory for Word2VecConfig")
 
-        if effective_words == MAX_SENTENCE_LEN:
-            logger.warning(
-                "batch buffer full at %i words; remaining sentences will be processed in next batch",
-                MAX_SENTENCE_LEN
-            )
-            break  # Process accumulated sentences in this batch, rest in next batch
-
-    # precompute "reduced window" offsets in a single randint() call
-    if model.shrink_windows:
-        for i, item in enumerate(model.random.randint(0, c.window, effective_words)):
-            c.reduced_windows[i] = item
-    else:
-        for i in range(effective_words):
-            c.reduced_windows[i] = 0
-
-    # release GIL & train on all sentences
-    with nogil:
-        for sent_idx in range(effective_sentences):
-            idx_start = c.sentence_idx[sent_idx]
-            idx_end = c.sentence_idx[sent_idx + 1]
-            for i in range(idx_start, idx_end):
-                j = i - c.window + c.reduced_windows[i]
-                if j < idx_start:
-                    j = idx_start
-                k = i + c.window + 1 - c.reduced_windows[i]
-                if k > idx_end:
-                    k = idx_end
-                for j in range(j, k):
-                    if j == i:
-                        continue
-                    if c.hs:
-                        w2v_fast_sentence_sg_hs(c.points[i], c.codes[i], c.codelens[i], c.syn0, c.syn1, c.size, c.indexes[j], c.alpha, c.work, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
-                    if c.negative:
-                        c.next_random = w2v_fast_sentence_sg_neg(c.negative, c.cum_table, c.cum_table_len, c.syn0, c.syn1neg, c.size, c.indexes[i], c.indexes[j], c.alpha, c.work, c.next_random, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
+    try:
+        init_w2v_config(&c, model, alpha, compute_loss, _work)
+        if c.sample:
+            vocab_sample_ints = <np.uint32_t *>np.PyArray_DATA(model.wv.expandos['sample_int'])
+        if c.hs:
+            vocab_codes = model.wv.expandos['code']
+            vocab_points = model.wv.expandos['point']
+    
+        # prepare C structures so we can go "full C" and release the Python GIL
+        c.sentence_idx[0] = 0  # indices of the first sentence always start at 0
+        for sent in sentences:
+            if not sent:
+                continue  # ignore empty sentences; leave effective_sentences unchanged
+            for token in sent:
+                if token not in model.wv.key_to_index:
+                    continue  # leaving `effective_words` unchanged = shortening the sentence = expanding the window
+                word_index = model.wv.key_to_index[token]
+                if c.sample and vocab_sample_ints[word_index] < random_int32(&c.next_random):
+                    continue
+                c.indexes[effective_words] = word_index
+                if c.hs:
+                    c.codelens[effective_words] = <int>len(vocab_codes[word_index])
+                    c.codes[effective_words] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
+                    c.points[effective_words] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
+                effective_words += 1
+                if effective_words >= total_words:
+                    # Should not happen as we allocated total_words
+                    break 
+    
+            # keep track of which words go into which sentence, so we don't train
+            # across sentence boundaries.
+            # indices of sentence number X are between <sentence_idx[X], sentence_idx[X])
+            effective_sentences += 1
+            c.sentence_idx[effective_sentences] = effective_words
+            
+            if effective_words >= total_words:
+                 break
+    
+        # precompute "reduced window" offsets in a single randint() call
+        if model.shrink_windows:
+            for i, item in enumerate(model.random.randint(0, c.window, effective_words)):
+                c.reduced_windows[i] = item
+        else:
+            for i in range(effective_words):
+                c.reduced_windows[i] = 0
+    
+        # release GIL & train on all sentences
+        with nogil:
+            for sent_idx in range(effective_sentences):
+                idx_start = c.sentence_idx[sent_idx]
+                idx_end = c.sentence_idx[sent_idx + 1]
+                for i in range(idx_start, idx_end):
+                    j = i - c.window + c.reduced_windows[i]
+                    if j < idx_start:
+                        j = idx_start
+                    k = i + c.window + 1 - c.reduced_windows[i]
+                    if k > idx_end:
+                        k = idx_end
+                    for j in range(j, k):
+                        if j == i:
+                            continue
+                        if c.hs:
+                            w2v_fast_sentence_sg_hs(c.points[i], c.codes[i], c.codelens[i], c.syn0, c.syn1, c.size, c.indexes[j], c.alpha, c.work, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
+                        if c.negative:
+                            c.next_random = w2v_fast_sentence_sg_neg(c.negative, c.cum_table, c.cum_table_len, c.syn0, c.syn1neg, c.size, c.indexes[i], c.indexes[j], c.alpha, c.work, c.next_random, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
+    finally:
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.sentence_idx: free(c.sentence_idx)
+        if c.codelens: free(c.codelens)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
 
     model.running_training_loss = c.running_training_loss
     return effective_words
@@ -636,74 +666,99 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
     cdef int sent_idx, idx_start, idx_end
     cdef np.uint32_t *vocab_sample_ints
 
-    init_w2v_config(&c, model, alpha, compute_loss, _work, _neu1)
-    if c.sample:
-        vocab_sample_ints = <np.uint32_t *>np.PyArray_DATA(model.wv.expandos['sample_int'])
-    if c.hs:
-        vocab_codes = model.wv.expandos['code']
-        vocab_points = model.wv.expandos['point']
-
-    # prepare C structures so we can go "full C" and release the Python GIL
-    c.sentence_idx[0] = 0  # indices of the first sentence always start at 0
+    cdef size_t total_words = 0
+    cdef size_t total_sents = 0
+    # Scan sentences for total length
     for sent in sentences:
-        if not sent:
-            continue  # ignore empty sentences; leave effective_sentences unchanged
-        for token in sent:
-            if token not in model.wv.key_to_index:
-                continue  # leaving `effective_words` unchanged = shortening the sentence = expanding the window
-            word_index = model.wv.key_to_index[token]
-            if c.sample and vocab_sample_ints[word_index] < random_int32(&c.next_random):
-                continue
-            c.indexes[effective_words] = word_index
-            if c.hs:
-                c.codelens[effective_words] = <int>len(vocab_codes[word_index])
-                c.codes[effective_words] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
-                c.points[effective_words] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
-            effective_words += 1
-            if effective_words == MAX_SENTENCE_LEN:
-                logger.warning(
-                    "sentence #%i truncated to %i words (from %i words total)",
-                    effective_sentences, MAX_SENTENCE_LEN, len(list(sent))
-                )
-                break  # Stop processing this sentence
+        total_words += len(sent)
+        total_sents += 1
+    if total_words < 1000: total_words = 1000
 
-        # keep track of which words go into which sentence, so we don't train
-        # across sentence boundaries.
-        # indices of sentence number X are between <sentence_idx[X], sentence_idx[X])
-        effective_sentences += 1
-        c.sentence_idx[effective_sentences] = effective_words
+    # Allocate dynamic arrays
+    c.indexes = <np.uint32_t *>malloc(total_words * sizeof(np.uint32_t))
+    c.reduced_windows = <np.uint32_t *>malloc(total_words * sizeof(np.uint32_t))
+    c.sentence_idx = <int *>malloc((total_sents + 1) * sizeof(int))
+    c.codelens = <int *>malloc(total_words * sizeof(int))
+    c.points = <np.uint32_t **>malloc(total_words * sizeof(np.uint32_t *))
+    c.codes = <np.uint8_t **>malloc(total_words * sizeof(np.uint8_t *))
 
-        if effective_words == MAX_SENTENCE_LEN:
-            logger.warning(
-                "batch buffer full at %i words; remaining sentences will be processed in next batch",
-                MAX_SENTENCE_LEN
-            )
-            break  # Process accumulated sentences in this batch, rest in next batch
+    if not (c.indexes and c.reduced_windows and c.sentence_idx and c.codelens and c.points and c.codes):
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.sentence_idx: free(c.sentence_idx)
+        if c.codelens: free(c.codelens)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        raise MemoryError("Failed to allocate memory for Word2VecConfig")
 
-    # precompute "reduced window" offsets in a single randint() call
-    if model.shrink_windows:
-        for i, item in enumerate(model.random.randint(0, c.window, effective_words)):
-            c.reduced_windows[i] = item
-    else:
-        for i in range(effective_words):
-            c.reduced_windows[i] = 0
-
-    # release GIL & train on all sentences
-    with nogil:
-        for sent_idx in range(effective_sentences):
-            idx_start = c.sentence_idx[sent_idx]
-            idx_end = c.sentence_idx[sent_idx + 1]
-            for i in range(idx_start, idx_end):
-                j = i - c.window + c.reduced_windows[i]
-                if j < idx_start:
-                    j = idx_start
-                k = i + c.window + 1 - c.reduced_windows[i]
-                if k > idx_end:
-                    k = idx_end
+    try:
+        init_w2v_config(&c, model, alpha, compute_loss, _work, _neu1)
+        if c.sample:
+            vocab_sample_ints = <np.uint32_t *>np.PyArray_DATA(model.wv.expandos['sample_int'])
+        if c.hs:
+            vocab_codes = model.wv.expandos['code']
+            vocab_points = model.wv.expandos['point']
+    
+        # prepare C structures so we can go "full C" and release the Python GIL
+        c.sentence_idx[0] = 0  # indices of the first sentence always start at 0
+        for sent in sentences:
+            if not sent:
+                continue  # ignore empty sentences; leave effective_sentences unchanged
+            for token in sent:
+                if token not in model.wv.key_to_index:
+                    continue  # leaving `effective_words` unchanged = shortening the sentence = expanding the window
+                word_index = model.wv.key_to_index[token]
+                if c.sample and vocab_sample_ints[word_index] < random_int32(&c.next_random):
+                    continue
+                c.indexes[effective_words] = word_index
                 if c.hs:
-                    w2v_fast_sentence_cbow_hs(c.points[i], c.codes[i], c.codelens, c.neu1, c.syn0, c.syn1, c.size, c.indexes, c.alpha, c.work, i, j, k, c.cbow_mean, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
-                if c.negative:
-                    c.next_random = w2v_fast_sentence_cbow_neg(c.negative, c.cum_table, c.cum_table_len, c.codelens, c.neu1, c.syn0, c.syn1neg, c.size, c.indexes, c.alpha, c.work, i, j, k, c.cbow_mean, c.next_random, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
+                    c.codelens[effective_words] = <int>len(vocab_codes[word_index])
+                    c.codes[effective_words] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
+                    c.points[effective_words] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
+                effective_words += 1
+                if effective_words >= total_words:
+                    break
+    
+            # keep track of which words go into which sentence, so we don't train
+            # across sentence boundaries.
+            # indices of sentence number X are between <sentence_idx[X], sentence_idx[X])
+            effective_sentences += 1
+            c.sentence_idx[effective_sentences] = effective_words
+    
+            if effective_words >= total_words:
+                break
+    
+        # precompute "reduced window" offsets in a single randint() call
+        if model.shrink_windows:
+            for i, item in enumerate(model.random.randint(0, c.window, effective_words)):
+                c.reduced_windows[i] = item
+        else:
+            for i in range(effective_words):
+                c.reduced_windows[i] = 0
+    
+        # release GIL & train on all sentences
+        with nogil:
+            for sent_idx in range(effective_sentences):
+                idx_start = c.sentence_idx[sent_idx]
+                idx_end = c.sentence_idx[sent_idx + 1]
+                for i in range(idx_start, idx_end):
+                    j = i - c.window + c.reduced_windows[i]
+                    if j < idx_start:
+                        j = idx_start
+                    k = i + c.window + 1 - c.reduced_windows[i]
+                    if k > idx_end:
+                        k = idx_end
+                    if c.hs:
+                        w2v_fast_sentence_cbow_hs(c.points[i], c.codes[i], c.codelens, c.neu1, c.syn0, c.syn1, c.size, c.indexes, c.alpha, c.work, i, j, k, c.cbow_mean, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
+                    if c.negative:
+                        c.next_random = w2v_fast_sentence_cbow_neg(c.negative, c.cum_table, c.cum_table_len, c.codelens, c.neu1, c.syn0, c.syn1neg, c.size, c.indexes, c.alpha, c.work, i, j, k, c.cbow_mean, c.next_random, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
+    finally:
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.sentence_idx: free(c.sentence_idx)
+        if c.codelens: free(c.codelens)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
 
     model.running_training_loss = c.running_training_loss
     return effective_words
@@ -747,61 +802,73 @@ def score_sentence_sg(model, sentence, _work):
     # convert Python structures to primitive types, so we can release the GIL
     c.work = <REAL_t *>np.PyArray_DATA(_work)
 
-    vocab_codes = model.wv.expandos['code']
-    vocab_points = model.wv.expandos['point']
-    i = 0
-    for token in sentence:
-        word_index = model.wv.key_to_index[token] if token in model.wv.key_to_index else None
-        if word_index is None:
-            # For score, should this be a default negative value?
-            #
-            # See comment by @gojomo at https://github.com/RaRe-Technologies/gensim/pull/2698/files#r445827846 :
-            #
-            # These 'score' functions are a long-ago contribution from @mataddy whose
-            # current function/utility is unclear.
-            # I've continued to apply mechanical updates to match other changes, and the code
-            # still compiles & passes the one (trivial, form-but-not-function) unit test. But it's an
-            # idiosyncratic technique, and only works for the non-default hs mode. Here, in lieu of the
-            # previous cryptic # should drop the comment, I've asked if for the purposes of this
-            # particular kind of 'scoring' (really, loss-tallying indicating how divergent this new
-            # text is from what the model learned during training), shouldn't completely missing
-            # words imply something very negative, as opposed to nothing-at-all? But probably, this
-            # functionality should be dropped. (And ultimately, a talented cleanup of the largely-broken
-            # loss-tallying functions might provide a cleaner window into this same measure of how
-            # well a text contrasts with model expectations - such as a way to report loss from a
-            # single invocation of one fo the inner train methods, without changing the model.)
-            continue
-        c.indexes[i] = word_index
-        c.codelens[i] = <int>len(vocab_codes[word_index])
-        c.codes[i] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
-        c.points[i] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
-        result += 1
-        i += 1
-        if i == MAX_SENTENCE_LEN:
-            logger.warning(
-                "sentence truncated to %i words for scoring (from %i words total)",
-                MAX_SENTENCE_LEN, len(list(sentence))
-            )
-            break  # Stop processing this sentence
-    sentence_len = i
+    c.points = <np.uint32_t **>malloc(len(sentence) * sizeof(np.uint32_t *))
+    c.codes = <np.uint8_t **>malloc(len(sentence) * sizeof(np.uint8_t *))
+    c.codelens = <int *>malloc(len(sentence) * sizeof(int))
+    c.indexes = <np.uint32_t *>malloc(len(sentence) * sizeof(np.uint32_t))
 
-    # release GIL & train on the sentence
-    c.work[0] = 0.0
+    if not (c.points and c.codes and c.codelens and c.indexes):
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        if c.codelens: free(c.codelens)
+        if c.indexes: free(c.indexes)
+        raise MemoryError("Failed to allocate memory for scoring")
 
-    with nogil:
-        for i in range(sentence_len):
-            if c.codelens[i] == 0:
+    try:
+        vocab_codes = model.wv.expandos['code']
+        vocab_points = model.wv.expandos['point']
+        i = 0
+        for token in sentence:
+            word_index = model.wv.key_to_index[token] if token in model.wv.key_to_index else None
+            if word_index is None:
+                # For score, should this be a default negative value?
+                #
+                # See comment by @gojomo at https://github.com/RaRe-Technologies/gensim/pull/2698/files#r445827846 :
+                #
+                # These 'score' functions are a long-ago contribution from @mataddy whose
+                # current function/utility is unclear.
+                # I've continued to apply mechanical updates to match other changes, and the code
+                # still compiles & passes the one (trivial, form-but-not-function) unit test. But it's an
+                # idiosyncratic technique, and only works for the non-default hs mode. Here, in lieu of the
+                # previous cryptic # should drop the comment, I've asked if for the purposes of this
+                # particular kind of 'scoring' (really, loss-tallying indicating how divergent this new
+                # text is from what the model learned during training), shouldn't completely missing
+                # words imply something very negative, as opposed to nothing-at-all? But probably, this
+                # functionality should be dropped. (And ultimately, a talented cleanup of the largely-broken
+                # loss-tallying functions might provide a cleaner window into this same measure of how
+                # well a text contrasts with model expectations - such as a way to report loss from a
+                # single invocation of one fo the inner train methods, without changing the model.)
                 continue
-            j = i - c.window
-            if j < 0:
-                j = 0
-            k = i + c.window + 1
-            if k > sentence_len:
-                k = sentence_len
-            for j in range(j, k):
-                if j == i or c.codelens[j] == 0:
+            c.indexes[i] = word_index
+            c.codelens[i] = <int>len(vocab_codes[word_index])
+            c.codes[i] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
+            c.points[i] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
+            result += 1
+            i += 1
+        sentence_len = i
+    
+        # release GIL & train on the sentence
+        c.work[0] = 0.0
+    
+        with nogil:
+            for i in range(sentence_len):
+                if c.codelens[i] == 0:
                     continue
-                score_pair_sg_hs(c.points[i], c.codes[i], c.codelens[i], c.syn0, c.syn1, c.size, c.indexes[j], c.work)
+                j = i - c.window
+                if j < 0:
+                    j = 0
+                k = i + c.window + 1
+                if k > sentence_len:
+                    k = sentence_len
+                for j in range(j, k):
+                    if j == i or c.codelens[j] == 0:
+                        continue
+                    score_pair_sg_hs(c.points[i], c.codes[i], c.codelens[i], c.syn0, c.syn1, c.size, c.indexes[j], c.work)
+    finally:
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        if c.codelens: free(c.codelens)
+        if c.indexes: free(c.indexes)
 
     return c.work[0]
 
@@ -865,43 +932,59 @@ def score_sentence_cbow(model, sentence, _work, _neu1):
     c.work = <REAL_t *>np.PyArray_DATA(_work)
     c.neu1 = <REAL_t *>np.PyArray_DATA(_neu1)
 
-    vocab_codes = model.wv.expandos['code']
-    vocab_points = model.wv.expandos['point']
-    i = 0
-    for token in sentence:
-        word_index = model.wv.key_to_index[token] if token in model.wv.key_to_index else None
-        if word_index is None:
-            continue  # for score, should this be a default negative value?
-        c.indexes[i] = word_index
-        c.codelens[i] = <int>len(vocab_codes[word_index])
-        c.codes[i] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
-        c.points[i] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
-        result += 1
-        i += 1
-        if i == MAX_SENTENCE_LEN:
-            break  # TODO: log warning, tally overflow?
-    sentence_len = i
+    c.points = <np.uint32_t **>malloc(len(sentence) * sizeof(np.uint32_t *))
+    c.codes = <np.uint8_t **>malloc(len(sentence) * sizeof(np.uint8_t *))
+    c.codelens = <int *>malloc(len(sentence) * sizeof(int))
+    c.indexes = <np.uint32_t *>malloc(len(sentence) * sizeof(np.uint32_t))
 
-    # release GIL & train on the sentence
-    c.work[0] = 0.0
-    with nogil:
-        for i in range(sentence_len):
-            if c.codelens[i] == 0:
-                continue
-            j = i - c.window
-            if j < 0:
-                j = 0
-            k = i + c.window + 1
-            if k > sentence_len:
-                k = sentence_len
-            score_pair_cbow_hs(c.points[i], c.codes[i], c.codelens, c.neu1, c.syn0, c.syn1, c.size, c.indexes, c.work, i, j, k, c.cbow_mean)
+    if not (c.points and c.codes and c.codelens and c.indexes):
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        if c.codelens: free(c.codelens)
+        if c.indexes: free(c.indexes)
+        raise MemoryError("Failed to allocate memory for scoring")
+
+    try:
+        vocab_codes = model.wv.expandos['code']
+        vocab_points = model.wv.expandos['point']
+        i = 0
+        for token in sentence:
+            word_index = model.wv.key_to_index[token] if token in model.wv.key_to_index else None
+            if word_index is None:
+                continue  # for score, should this be a default negative value?
+            c.indexes[i] = word_index
+            c.codelens[i] = <int>len(vocab_codes[word_index])
+            c.codes[i] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
+            c.points[i] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
+            result += 1
+            i += 1
+        sentence_len = i
+    
+        # release GIL & train on the sentence
+        c.work[0] = 0.0
+        with nogil:
+            for i in range(sentence_len):
+                if c.codelens[i] == 0:
+                    continue
+                j = i - c.window
+                if j < 0:
+                    j = 0
+                k = i + c.window + 1
+                if k > sentence_len:
+                    k = sentence_len
+                score_pair_cbow_hs(c.points[i], c.codes[i], c.codelens, c.neu1, c.syn0, c.syn1, c.size, c.indexes, c.work, i, j, k, c.cbow_mean)
+    finally:
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        if c.codelens: free(c.codelens)
+        if c.indexes: free(c.indexes)
 
     return c.work[0]
 
 cdef void score_pair_cbow_hs(
-    const np.uint32_t *word_point, const np.uint8_t *word_code, int codelens[MAX_SENTENCE_LEN],
+    const np.uint32_t *word_point, const np.uint8_t *word_code, int *codelens,
     REAL_t *neu1, REAL_t *syn0, REAL_t *syn1, const int size,
-    const np.uint32_t indexes[MAX_SENTENCE_LEN], REAL_t *work,
+    const np.uint32_t *indexes, REAL_t *work,
     int i, int j, int k, int cbow_mean) noexcept nogil:
 
     cdef long long a, b
@@ -981,4 +1064,4 @@ def init():
         return 2
 
 FAST_VERSION = init()  # initialize the module
-MAX_WORDS_IN_BATCH = MAX_SENTENCE_LEN
+MAX_WORDS_IN_BATCH = 10000
