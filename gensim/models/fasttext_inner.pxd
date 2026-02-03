@@ -17,7 +17,7 @@ cimport numpy as np
 from gensim.models.word2vec_inner cimport REAL_t
 
 
-DEF MAX_SENTENCE_LEN = 10000
+
 
 
 cdef struct FastTextConfig:
@@ -85,18 +85,18 @@ cdef struct FastTextConfig:
     #   - indexes[N]: the index of the Nth token within the vocabulary
     #   - reduced_windows[N]: a random integer by which to resize the window around the Nth token
     #
-    np.uint32_t indexes[MAX_SENTENCE_LEN]
-    np.uint32_t reduced_windows[MAX_SENTENCE_LEN]
+    np.uint32_t *indexes
+    np.uint32_t *reduced_windows
 
     #
     # We keep track of sentence boundaries here.  The tokens of the Xth
     # sentence will be between [sentence_idx[X], sentence_idx[X + 1]).
     #
-    int sentence_idx[MAX_SENTENCE_LEN + 1]
+    int *sentence_idx
 
     # For hierarchical softmax
     REAL_t *syn1
-    np.uint32_t *points[MAX_SENTENCE_LEN]
+    np.uint32_t **points
 
     #
     # Each vocabulary term has a binary code, with frequent terms having
@@ -105,8 +105,8 @@ cdef struct FastTextConfig:
     # this is C, we need to keep the lengths of each code as well as the codes
     # themselves.
     #
-    np.uint8_t *codes[MAX_SENTENCE_LEN]
-    int codelens[MAX_SENTENCE_LEN]
+    np.uint8_t **codes
+    int *codelens
 
     # For negative sampling
     REAL_t *syn1neg
@@ -122,8 +122,8 @@ cdef struct FastTextConfig:
     # store the length of that array separately: that's what subwords_idx_len
     # is for.
     #
-    int subwords_idx_len[MAX_SENTENCE_LEN]
-    np.uint32_t *subwords_idx[MAX_SENTENCE_LEN]
+    int *subwords_idx_len
+    np.uint32_t **subwords_idx
 
 
 #

@@ -25,6 +25,7 @@ cimport numpy as np
 from libcpp.string cimport string
 from libcpp.vector cimport vector
 from libcpp cimport bool as bool_t
+from libc.stdlib cimport malloc, free, calloc
 
 from gensim.models.word2vec_inner cimport (
     w2v_fast_sentence_sg_hs,
@@ -216,6 +217,8 @@ cdef void prepare_c_structures_for_batch(
                 codelens[effective_words[0]] = word.code_len
                 codes[effective_words[0]] = word.code
                 points[effective_words[0]] = word.point
+            else:
+                codelens[effective_words[0]] = 0
             effective_words[0] += 1
             if effective_words[0] == MAX_SENTENCE_LEN:
                 break  # TODO: log warning, tally overflow?
@@ -309,6 +312,25 @@ def train_epoch_sg(model, corpus_file, offset, _cython_vocab, _cur_epoch, _expec
 
     init_w2v_config(&c, model, _alpha, compute_loss, _work)
 
+    # Allocate dynamic memory for Word2VecConfig
+    # We use MAX_SENTENCE_LEN as that is the default batch size for CythonLineSentence
+    # Ideally this should match input_stream.max_words_in_batch
+    c.indexes = <np.uint32_t *>calloc(MAX_SENTENCE_LEN, sizeof(np.uint32_t))
+    c.reduced_windows = <np.uint32_t *>calloc(MAX_SENTENCE_LEN, sizeof(np.uint32_t))
+    c.sentence_idx = <int *>calloc((MAX_SENTENCE_LEN + 1), sizeof(int))
+    c.codelens = <int *>calloc(MAX_SENTENCE_LEN, sizeof(int))
+    c.points = <np.uint32_t **>calloc(MAX_SENTENCE_LEN, sizeof(np.uint32_t *))
+    c.codes = <np.uint8_t **>calloc(MAX_SENTENCE_LEN, sizeof(np.uint8_t *))
+
+    if not (c.indexes and c.reduced_windows and c.sentence_idx and c.codelens and c.points and c.codes):
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.sentence_idx: free(c.sentence_idx)
+        if c.codelens: free(c.codelens)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        raise MemoryError("Failed to allocate memory for Word2VecConfig in corpusfile training")
+
     cdef vector[vector[string]] sentences
 
     with nogil:
@@ -355,6 +377,13 @@ def train_epoch_sg(model, corpus_file, offset, _cython_vocab, _cur_epoch, _expec
             c.alpha = get_next_alpha(
                 start_alpha, end_alpha, total_sentences, total_words,
                 expected_examples, expected_words, cur_epoch, num_epochs)
+
+    if c.indexes: free(c.indexes)
+    if c.reduced_windows: free(c.reduced_windows)
+    if c.sentence_idx: free(c.sentence_idx)
+    if c.codelens: free(c.codelens)
+    if c.points: free(c.points)
+    if c.codes: free(c.codes)
 
     model.running_training_loss = c.running_training_loss
     return total_sentences, total_effective_words, total_words
@@ -410,6 +439,23 @@ def train_epoch_cbow(model, corpus_file, offset, _cython_vocab, _cur_epoch, _exp
 
     init_w2v_config(&c, model, _alpha, compute_loss, _work, _neu1)
 
+    # Allocate dynamic memory for Word2VecConfig
+    c.indexes = <np.uint32_t *>calloc(MAX_SENTENCE_LEN, sizeof(np.uint32_t))
+    c.reduced_windows = <np.uint32_t *>calloc(MAX_SENTENCE_LEN, sizeof(np.uint32_t))
+    c.sentence_idx = <int *>calloc((MAX_SENTENCE_LEN + 1), sizeof(int))
+    c.codelens = <int *>calloc(MAX_SENTENCE_LEN, sizeof(int))
+    c.points = <np.uint32_t **>calloc(MAX_SENTENCE_LEN, sizeof(np.uint32_t *))
+    c.codes = <np.uint8_t **>calloc(MAX_SENTENCE_LEN, sizeof(np.uint8_t *))
+
+    if not (c.indexes and c.reduced_windows and c.sentence_idx and c.codelens and c.points and c.codes):
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.sentence_idx: free(c.sentence_idx)
+        if c.codelens: free(c.codelens)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        raise MemoryError("Failed to allocate memory for Word2VecConfig in corpusfile training")
+
     cdef vector[vector[string]] sentences
 
     with nogil:
@@ -454,6 +500,13 @@ def train_epoch_cbow(model, corpus_file, offset, _cython_vocab, _cur_epoch, _exp
             c.alpha = get_next_alpha(
                 start_alpha, end_alpha, total_sentences, total_words,
                 expected_examples, expected_words, cur_epoch, num_epochs)
+
+    if c.indexes: free(c.indexes)
+    if c.reduced_windows: free(c.reduced_windows)
+    if c.sentence_idx: free(c.sentence_idx)
+    if c.codelens: free(c.codelens)
+    if c.points: free(c.points)
+    if c.codes: free(c.codes)
 
     model.running_training_loss = c.running_training_loss
     return total_sentences, total_effective_words, total_words

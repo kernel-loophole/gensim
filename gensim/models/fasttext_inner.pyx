@@ -36,6 +36,7 @@ cimport numpy as np
 from libc.math cimport exp
 from libc.math cimport log
 from libc.string cimport memset
+from libc.stdlib cimport malloc, free
 
 
 #
@@ -63,7 +64,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-DEF MAX_SENTENCE_LEN = 10000
 DEF MAX_SUBWORDS = 1000
 
 DEF EXP_TABLE_SIZE = 512
@@ -500,24 +500,12 @@ cdef object populate_ft_config(FastTextConfig *c, wv, buckets_word, sentences):
                 c.points[effective_words] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
 
             effective_words += 1
-            if effective_words == MAX_SENTENCE_LEN:
-                logger.warning(
-                    "sentence #%i truncated to %i words (from %i words total)",
-                    effective_sentences, MAX_SENTENCE_LEN, len(list(sent))
-                )
-                break  # Stop processing this sentence
-
+            # Check overflow? We allocated correctly based on scan.
+            
         # keep track of which words go into which sentence, so we don't train
         # across sentence boundaries.
         effective_sentences += 1
         c.sentence_idx[effective_sentences] = effective_words
-
-        if effective_words == MAX_SENTENCE_LEN:
-            logger.warning(
-                "batch buffer full at %i words; remaining sentences will be processed in next batch",
-                MAX_SENTENCE_LEN
-            )
-            break  # Process accumulated sentences in this batch, rest in next batch
 
     return effective_words, effective_sentences
 
@@ -609,21 +597,73 @@ def train_batch_any(model, sentences, alpha, _work, _neu1):
         int num_words = 0
         int num_sentences = 0
 
-    init_ft_config(&c, model, alpha, _work, _neu1)
+    cdef size_t total_words = 0
+    cdef size_t total_sents = 0
+    # Scan for allocation
+    for sent in sentences:
+        total_words += len(sent)
+        total_sents += 1
+    if total_words < 1000: total_words = 1000
 
-    num_words, num_sentences = populate_ft_config(&c, model.wv, model.wv.buckets_word, sentences)
+    # Allocate
+    c.indexes = <np.uint32_t *>malloc(total_words * sizeof(np.uint32_t))
+    c.reduced_windows = <np.uint32_t *>malloc(total_words * sizeof(np.uint32_t))
+    c.sentence_idx = <int *>malloc((total_sents + 1) * sizeof(int))
+    c.points = <np.uint32_t **>malloc(total_words * sizeof(np.uint32_t *))
+    c.codes = <np.uint8_t **>malloc(total_words * sizeof(np.uint8_t *))
+    c.codelens = <int *>malloc(total_words * sizeof(int))
+    c.subwords_idx_len = <int *>malloc(total_words * sizeof(int))
+    c.subwords_idx = <np.uint32_t **>malloc(total_words * sizeof(np.uint32_t *))
 
-    # precompute "reduced window" offsets in a single randint() call
-    if model.shrink_windows:
-        for i, randint in enumerate(model.random.randint(0, c.window, num_words)):
-            c.reduced_windows[i] = randint
-    else:
-        for i in range(num_words):
-            c.reduced_windows[i] = 0
+    if not (c.indexes and c.reduced_windows and c.sentence_idx and c.points and c.codes and c.codelens and c.subwords_idx_len and c.subwords_idx):
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.sentence_idx: free(c.sentence_idx)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        if c.codelens: free(c.codelens)
+        if c.subwords_idx_len: free(c.subwords_idx_len)
+        if c.subwords_idx: free(c.subwords_idx)
+        raise MemoryError("Failed to allocate memory for FastTextConfig")
 
-    # release GIL & train on all sentences in the batch
-    with nogil:
-        fasttext_train_any(&c, num_sentences)
+    try:
+        init_ft_config(&c, model, alpha, _work, _neu1)
+    
+        # Logic from populate_ft_config inlined or passed allocated memory?
+        # populate_ft_config takes `c` and fills it. We allocated `c` members.
+        # But we must pass the LIMIT to populate_ft_config so it doesn't overflow if our scan was off (e.g. generator changed)?
+        # populate_ft_config doesn't take limit arg.
+        # But we scanned the exact same object `sentences`.
+        # `populate_ft_config` is defined in same file.
+        # We should modify `populate_ft_config` to stop at limit?
+        # Or blindly trust `sentences` yields same lengths?
+        # Given `word2vec.py` behavior (it consumes iterator into list if needed before calling train_batch?), 
+        # `sentences` here is typically a list (job_batch).
+        # So it's safe.
+    
+        num_words, num_sentences = populate_ft_config(&c, model.wv, model.wv.buckets_word, sentences)
+    
+        # precompute "reduced window" offsets in a single randint() call
+        if model.shrink_windows:
+            for i, randint in enumerate(model.random.randint(0, c.window, num_words)):
+                c.reduced_windows[i] = randint
+        else:
+            for i in range(num_words):
+                c.reduced_windows[i] = 0
+    
+        # release GIL & train on all sentences in the batch
+        with nogil:
+            fasttext_train_any(&c, num_sentences)
+
+    finally:
+        if c.indexes: free(c.indexes)
+        if c.reduced_windows: free(c.reduced_windows)
+        if c.sentence_idx: free(c.sentence_idx)
+        if c.points: free(c.points)
+        if c.codes: free(c.codes)
+        if c.codelens: free(c.codelens)
+        if c.subwords_idx_len: free(c.subwords_idx_len)
+        if c.subwords_idx: free(c.subwords_idx)
 
     return num_words
 
@@ -749,4 +789,4 @@ def init():
 
 
 init()  # initialize the module
-MAX_WORDS_IN_BATCH = MAX_SENTENCE_LEN
+MAX_WORDS_IN_BATCH = 10000

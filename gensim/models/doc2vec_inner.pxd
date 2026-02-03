@@ -18,7 +18,7 @@ cimport numpy as np
 
 from gensim.models.word2vec_inner cimport REAL_t
 
-DEF MAX_DOCUMENT_LEN = 10000
+
 
 
 cdef struct Doc2VecConfig:
@@ -36,16 +36,16 @@ cdef struct Doc2VecConfig:
     REAL_t alpha
     int layer1_size, vector_size
 
-    int codelens[MAX_DOCUMENT_LEN]
-    np.uint32_t indexes[MAX_DOCUMENT_LEN]
-    np.uint32_t doctag_indexes[MAX_DOCUMENT_LEN]
-    np.uint32_t window_indexes[MAX_DOCUMENT_LEN]
-    np.uint32_t reduced_windows[MAX_DOCUMENT_LEN]
+    int *codelens
+    np.uint32_t *indexes
+    np.uint32_t *doctag_indexes
+    np.uint32_t *window_indexes
+    np.uint32_t *reduced_windows
 
     # For hierarchical softmax
     REAL_t *syn1
-    np.uint32_t *points[MAX_DOCUMENT_LEN]
-    np.uint8_t *codes[MAX_DOCUMENT_LEN]
+    np.uint32_t **points
+    np.uint8_t **codes
 
     # For negative sampling
     REAL_t *syn1neg
